@@ -13,12 +13,13 @@ use crate::handshake::{
 use crate::parse_buffer::ParseError;
 use const_oid::ObjectIdentifier;
 use core::marker::PhantomData;
-use der::Decode;
+use der::{AnyRef, Decode, Reader, Sequence, SliceReader, Tag, TagNumber, Tagged};
 use digest::Digest;
 use heapless::{String, Vec};
 
 const HOSTNAME_MAXLEN: usize = 64;
 const COMMON_NAME_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.3");
+const SUBJECT_ALT_NAME_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.17");
 
 pub struct CertificateChain<'a> {
     prev: Option<&'a CertificateEntryRef<'a>>,
@@ -117,16 +118,38 @@ where
             return Err(TlsError::Unimplemented);
         };
 
-        let mut cn = None;
-        for (p, q) in CertificateChain::new(&ca.into(), &cert) {
-            cn = verify_certificate(p, q, Clock::now())?;
+        let ca_entry: CertificateEntryRef = ca.into();
+
+        // Verify the presented chain from the pinned anchor down to the leaf.
+        //
+        // Skip any presented entry that merely re-presents the pinned anchor
+        // (identical public key). Cloudflare / Google Trust Services, for
+        // example, send a cross-signed copy of the root as the top chain entry;
+        // its signature is by a CA outside the presented chain (and may use a
+        // different algorithm than the anchor's key), so it can neither be nor
+        // needs to be verified here. `issuer` stays pinned to the anchor across
+        // such skips, so a forged look-alike carrying a *different* key is not
+        // skipped and still fails verification against the real anchor.
+        let mut issuer: &CertificateEntryRef = &ca_entry;
+        for idx in (0..cert.entries.len()).rev() {
+            let entry = &cert.entries[idx];
+            if same_public_key(&ca_entry, entry)? {
+                continue;
+            }
+            verify_certificate(issuer, entry, Clock::now())?;
+            issuer = entry;
         }
-        if self.host.ne(&cn) {
-            error!(
-                "Hostname ({:?}) does not match CommonName ({:?})",
-                self.host, cn
-            );
-            return Err(TlsError::InvalidCertificate);
+
+        // Match the requested host against the leaf's CommonName *and* its
+        // subjectAltName dNSNames (with single-label `*.` wildcard support),
+        // rather than the CommonName alone — modern certificates carry the host
+        // only in the SAN.
+        if let Some(host) = self.host.as_deref() {
+            let leaf = cert.entries.first().ok_or(TlsError::InvalidCertificate)?;
+            if !leaf_identifies_host(leaf, host)? {
+                error!("Hostname {:?} not found in leaf certificate", host);
+                return Err(TlsError::InvalidCertificate);
+            }
         }
 
         self.certificate.replace(cert.try_into()?);
@@ -470,4 +493,148 @@ fn verify_certificate(
     }
 
     Ok(common_name)
+}
+
+/// A single X.509 v3 extension: `SEQUENCE { extnID, critical DEFAULT FALSE,
+/// extnValue OCTET STRING }`. `extn_value` is kept as an `AnyRef` so that
+/// `.value()` yields the raw extension contents.
+#[derive(Sequence)]
+struct Extension<'a> {
+    extn_id: ObjectIdentifier,
+    #[asn1(default = "critical_default")]
+    _critical: bool,
+    extn_value: AnyRef<'a>,
+}
+
+fn critical_default() -> bool {
+    false
+}
+
+/// Case-insensitive hostname match supporting a single leading `*.` wildcard
+/// label: `*.example.com` matches `a.example.com` but not `example.com` or
+/// `a.b.example.com`.
+fn hostname_matches(host: &str, pattern: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        match host.split_once('.') {
+            Some((label, rest)) => {
+                !label.is_empty() && !rest.is_empty() && rest.eq_ignore_ascii_case(suffix)
+            }
+            None => false,
+        }
+    } else {
+        !pattern.is_empty() && host.eq_ignore_ascii_case(pattern)
+    }
+}
+
+/// Whether the leaf certificate presents `host` as one of its subjectAltName
+/// dNSNames or (failing that) as its subject CommonName.
+fn leaf_identifies_host(leaf: &CertificateEntryRef, host: &str) -> Result<bool, TlsError> {
+    let leaf = match leaf {
+        CertificateEntryRef::X509(der) => der,
+        _ => return Ok(false),
+    };
+    let cert = DecodedCertificate::from_der(leaf).map_err(|_| TlsError::DecodeError)?;
+
+    // subjectAltName dNSNames are authoritative for host identity (RFC 6125).
+    if let Some(exts) = cert.tbs_certificate.extensions {
+        let mut reader = SliceReader::new(exts.value()).map_err(|_| TlsError::DecodeError)?;
+        while !reader.is_finished() {
+            let ext = Extension::decode(&mut reader).map_err(|_| TlsError::DecodeError)?;
+            if ext.extn_id != SUBJECT_ALT_NAME_OID {
+                continue;
+            }
+            // extnValue wraps GeneralNames ::= SEQUENCE OF GeneralName.
+            let general_names =
+                AnyRef::from_der(ext.extn_value.value()).map_err(|_| TlsError::DecodeError)?;
+            let mut names =
+                SliceReader::new(general_names.value()).map_err(|_| TlsError::DecodeError)?;
+            while !names.is_finished() {
+                let name = AnyRef::decode(&mut names).map_err(|_| TlsError::DecodeError)?;
+                // dNSName ::= [2] IMPLICIT IA5String
+                if name.tag()
+                    == (Tag::ContextSpecific {
+                        constructed: false,
+                        number: TagNumber(2),
+                    })
+                {
+                    if let Ok(dns) = core::str::from_utf8(name.value()) {
+                        if hostname_matches(host, dns) {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fall back to the subject CommonName.
+    for rdn in cert.tbs_certificate.subject.iter() {
+        if let Some(attr) = rdn.get(0) {
+            if attr.oid == COMMON_NAME_OID {
+                if let Ok(cn) = core::str::from_utf8(attr.value.value()) {
+                    if hostname_matches(host, cn) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+/// Whether two certificate entries carry the same public key (identical SPKI
+/// algorithm and key bits). Used to recognise a redundant re-presentation of
+/// the pinned trust anchor in the served chain.
+fn same_public_key(a: &CertificateEntryRef, b: &CertificateEntryRef) -> Result<bool, TlsError> {
+    let (a, b) = match (a, b) {
+        (CertificateEntryRef::X509(a), CertificateEntryRef::X509(b)) => (a, b),
+        _ => return Ok(false),
+    };
+    let a = DecodedCertificate::from_der(a).map_err(|_| TlsError::DecodeError)?;
+    let b = DecodedCertificate::from_der(b).map_err(|_| TlsError::DecodeError)?;
+    let a_spki = &a.tbs_certificate.subject_public_key_info;
+    let b_spki = &b.tbs_certificate.subject_public_key_info;
+    let keys_match = match (a_spki.public_key.as_bytes(), b_spki.public_key.as_bytes()) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    };
+    Ok(keys_match && a_spki.algorithm == b_spki.algorithm)
+}
+
+#[cfg(test)]
+mod fix_tests {
+    use super::{hostname_matches, leaf_identifies_host, same_public_key};
+    use crate::handshake::certificate::CertificateEntryRef;
+
+    // Real DER captured from the fred_jones staging worker's GTS chain.
+    const LEAF: &[u8] = include_bytes!("test_certs/leaf.der");
+    const WE1: &[u8] = include_bytes!("test_certs/we1.der");
+
+    #[test]
+    fn wildcard_and_exact_hostname_matching() {
+        assert!(hostname_matches("a.example.com", "*.example.com"));
+        assert!(!hostname_matches("example.com", "*.example.com"));
+        assert!(!hostname_matches("a.b.example.com", "*.example.com"));
+        assert!(hostname_matches("Example.COM", "example.com"));
+        assert!(!hostname_matches("evil.com", "example.com"));
+    }
+
+    #[test]
+    fn leaf_matches_via_wildcard_san() {
+        // Leaf CN is `pawelchcki.workers.dev`; the subdomain only matches the
+        // SAN `*.pawelchcki.workers.dev`, exercising the SAN path.
+        let leaf = CertificateEntryRef::X509(LEAF);
+        assert!(leaf_identifies_host(&leaf, "fred-jones-staging.pawelchcki.workers.dev").unwrap());
+        assert!(leaf_identifies_host(&leaf, "pawelchcki.workers.dev").unwrap());
+        assert!(!leaf_identifies_host(&leaf, "example.com").unwrap());
+    }
+
+    #[test]
+    fn distinct_certs_have_distinct_keys() {
+        let leaf = CertificateEntryRef::X509(LEAF);
+        let we1 = CertificateEntryRef::X509(WE1);
+        assert!(same_public_key(&leaf, &leaf).unwrap());
+        assert!(!same_public_key(&leaf, &we1).unwrap());
+    }
 }
