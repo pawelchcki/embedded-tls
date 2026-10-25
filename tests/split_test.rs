@@ -105,3 +105,38 @@ fn test_blocking_borrowed() {
         .map_err(|(_, e)| e)
         .expect("error closing session");
 }
+
+#[tokio::test]
+async fn test_async_borrowed_transport() {
+    use embedded_io_adapters::tokio_1::FromTokio;
+    use embedded_io_async::{Read as _, Write as _};
+    use embedded_tls::*;
+    let socket = tokio::net::TcpStream::connect(setup()).await.unwrap();
+    let mut read = [0; 16640];
+    let mut write = [0; 16640];
+    let mut tls = TlsConnection::new(FromTokio::new(socket), &mut read, &mut write);
+    let config = TlsConfig::new().with_server_name("localhost");
+    tls.open(TlsContext::new(
+        &config,
+        UnsecureProvider::new::<Aes128GcmSha256>(OsRng),
+    ))
+    .await
+    .unwrap();
+    let (mut reader, mut writer) = tls.split_with(|socket| {
+        let (reader, writer) = socket.inner_mut().split();
+        (FromTokio::new(reader), FromTokio::new(writer))
+    });
+    let send = async {
+        writer.write_all(b"ping").await.unwrap();
+        writer.flush().await.unwrap();
+    };
+    let receive = async {
+        let mut reply = [0; 4];
+        reader.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"ping");
+    };
+    tokio::join!(send, receive);
+    drop(reader);
+    drop(writer);
+    tls.close().await.map_err(|(_, error)| error).unwrap();
+}

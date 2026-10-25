@@ -279,18 +279,33 @@ where
     where
         Socket: Clone,
     {
+        self.split_with(|socket| (socket.clone(), socket.clone()))
+    }
+
+    /// Borrow independent transport directions without cloning the socket or
+    /// allocating. The callback splits the owned transport; both TLS halves
+    /// remain tied to this connection's lifetime and key/record state.
+    pub fn split_with<'s, R, W>(
+        &'s mut self,
+        split: impl FnOnce(&'s mut Socket) -> (R, W),
+    ) -> (TlsReader<'s, R, CipherSuite>, TlsWriter<'s, W, CipherSuite>)
+    where
+        R: AsyncRead + 's,
+        W: AsyncWrite + 's,
+    {
+        let (read, write) = split(&mut self.delegate);
         let (wks, rks) = self.key_schedule.as_split();
 
         let reader = TlsReader {
             opened: &self.opened,
-            delegate: self.delegate.clone(),
+            delegate: read,
             key_schedule: rks,
             record_reader: self.record_reader.reborrow_mut(),
             decrypted: &mut self.decrypted,
         };
         let writer = TlsWriter {
             opened: &self.opened,
-            delegate: self.delegate.clone(),
+            delegate: write,
             key_schedule: wks,
             record_write_buf: self.record_write_buf.reborrow_mut(),
             flush_policy: self.flush_policy,
