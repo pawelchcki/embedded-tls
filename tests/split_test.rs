@@ -140,3 +140,43 @@ async fn test_async_borrowed_transport() {
     drop(writer);
     tls.close().await.map_err(|(_, error)| error).unwrap();
 }
+
+#[tokio::test]
+async fn test_async_large_write_buffer_fragments_application_data() {
+    use embedded_io_adapters::tokio_1::FromTokio;
+    use embedded_io_async::{Read as _, Write as _};
+    use embedded_tls::*;
+    let socket = tokio::net::TcpStream::connect(setup()).await.unwrap();
+    let mut read = [0; 16640];
+    let mut write = [0; 65536];
+    let mut tls = TlsConnection::new(FromTokio::new(socket), &mut read, &mut write);
+    let config = TlsConfig::new().with_server_name("localhost");
+    tls.open(TlsContext::new(
+        &config,
+        UnsecureProvider::new::<Aes128GcmSha256>(OsRng),
+    ))
+    .await
+    .unwrap();
+    let payload: Vec<_> = (0..65553).map(|index| (index * 73) as u8).collect();
+    let (mut reader, mut writer) = tls.split_with(|socket| {
+        let (reader, writer) = socket.inner_mut().split();
+        (FromTokio::new(reader), FromTokio::new(writer))
+    });
+    let send = async {
+        writer.write_all(&payload).await.unwrap();
+        writer.flush().await.unwrap();
+    };
+    let receive = async {
+        let mut reply = vec![0; payload.len()];
+        reader.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, payload);
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(send, receive)
+    })
+    .await
+    .unwrap();
+    drop(reader);
+    drop(writer);
+    tls.close().await.map_err(|(_, error)| error).unwrap();
+}

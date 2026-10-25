@@ -111,7 +111,10 @@ impl<'a> WriteBuffer<'a> {
 
 impl WriteBufferBorrow<'_> {
     fn max_block_size(&self) -> usize {
-        self.buffer.len() - TLS_RECORD_OVERHEAD
+        // RFC 8446 section 5.1 limits application plaintext to 2^14 bytes.
+        // The position includes the five-byte record header. A larger caller
+        // buffer must not increase the protocol's record payload limit.
+        (self.buffer.len() - TLS_RECORD_OVERHEAD).min((1 << 14) + 5)
     }
 
     pub fn is_full(&self) -> bool {
@@ -132,6 +135,26 @@ impl WriteBufferBorrow<'_> {
 
     pub fn contains(&self, header: ClientRecordHeader) -> bool {
         self.current_header.as_ref() == Some(&header)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_storage_does_not_expand_application_record_payloads() {
+        let mut storage = [0; 65536];
+        for size in [256, 2048, 16384, 16896, 65536] {
+            let mut record = WriteBuffer::new(&mut storage[..size]);
+            record
+                .start_record(ClientRecordHeader::ApplicationData)
+                .unwrap();
+            let written = record.append(&[7; 32768]);
+            assert_eq!(written, (size - TLS_RECORD_OVERHEAD - 5).min(16384));
+            assert!(record.is_full());
+            assert_eq!(record.append(b"extra"), 0);
+        }
     }
 }
 
